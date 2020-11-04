@@ -27,6 +27,9 @@
 #include <string>
 #include <random>
 #include <vector>
+#include <cmath>
+#include <chrono>
+
 //Command-line parsing
 #include "CLI11.hpp"
 
@@ -38,9 +41,311 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+#define PARALLEL_BATCH 1
+
 //Global flag to silent verbose messages
 bool silent;
 
+class BenchmarkTimer
+{
+public:
+    BenchmarkTimer() {
+        reset();
+    }
+
+    void reset() {
+        m_startTime = std::chrono::high_resolution_clock::now();
+    }
+
+    template <typename Duration>
+    static double milliseconds(Duration dt)
+    {
+        return std::chrono::duration_cast<std::chrono::duration<double, std::ratio<1, 1000>>>(dt).count();
+    }
+
+    /// Return the precise ellapsed system time since creation of this object in milliseconds
+    double ellapsed() const
+    {
+        return milliseconds(std::chrono::high_resolution_clock::now() - m_startTime);
+    }
+
+private:
+    std::chrono::high_resolution_clock::time_point m_startTime;
+};
+
+class Vector3 {
+public:
+    using real = double;
+public:
+    static Vector3 DrawRandomDirection()
+    {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::normal_distribution<real> distrib;
+        
+        // simple heuristic: we remember the previous direction to
+        // always sample a new one otrhogonal to it.
+        static Vector3 previous(0, 0, 1);
+        
+        Vector3 d = Vector3(distrib(gen), distrib(gen), distrib(gen));
+        d = d - previous * d.dot(previous);
+        d = d.normalized();
+        previous = d;
+        return d;
+    }
+
+public:
+    Vector3() : x(0), y(0), z(0) {}
+    Vector3(real x, real y, real z) : x(x), y(y), z(z) {}
+
+    real norm() const {
+        return std::sqrt(dot(*this));
+    }
+
+    Vector3 normalized() const {
+        real scale = 1.f / norm();
+        return *this * scale;
+    }
+
+    real dot(const Vector3 & other) const {
+        return x * other.x + y * other.y + z * other.z;
+    }
+
+    Vector3 operator*(real scale) const {
+        return Vector3(x * scale, y * scale, z * scale);
+    }
+
+    Vector3 operator+(const Vector3 & other) const {
+        return Vector3(x + other.x, y + other.y, z + other.z);
+    }
+
+    void operator*=(real scale) {
+        x *= scale;
+        y *= scale;
+        z *= scale;
+    }
+
+    void operator+=(const Vector3& other) {
+        x += other.x;
+        y += other.y;
+        z += other.z;
+    }
+
+    void operator-=(const Vector3& other) {
+        x -= other.x;
+        y -= other.y;
+        z -= other.z;
+    }
+
+    Vector3 operator-(const Vector3& other) const {
+        return Vector3(x - other.x, y - other.y, z - other.z);
+    }
+
+    friend std::ostream & operator<<(std::ostream& os, const Vector3 & v) {
+        os << "Vector(" << v.x << ", " << v.y << ", " << v.z << ")";
+        return os;
+    }
+    
+public:
+    real x, y, z;
+};
+
+class Image
+{
+public:
+    Image(const std::string & filename, const std::string& name = "")
+    {
+        int nbChannels;
+        unsigned char* data = stbi_load(filename.c_str(), &width, &height, &nbChannels, 0);
+        if (!silent) std::cout << name << ": " << width << "x" << height << "   (" << nbChannels << ")" << std::endl;
+
+        if (nbChannels < 3)
+        {
+            std::cout << "Input images must be RGB images." << std::endl;
+            exit(1);
+        }
+
+        // Convert to doubles
+        pixels.resize(width * height);
+        for (int i = 0; i < pixels.size(); ++i) {
+            int offset = nbChannels * i;
+            pixels[i].x = static_cast<double>(data[offset + 0]) / 255.0;
+            pixels[i].y = static_cast<double>(data[offset + 1]) / 255.0;
+            pixels[i].z = static_cast<double>(data[offset + 2]) / 255.0;
+        }
+        stbi_image_free(data);
+    }
+
+    Image(int width, int height)
+        : width(width)
+        , height(height)
+    {
+        pixels.resize(width * height);
+    }
+
+    //Image(const Image& other) = delete;
+    //Image & operator=(const Image&) = delete;
+
+    Image && copy() const {
+        Image img(width, height);
+        img.pixels = pixels;
+        return std::move(img);
+    }
+
+    int indexPixel(int i, int j) const {
+        return width * j + i;
+    }
+
+    const Vector3 & colorAt(int i, int j) const {
+        int offset = indexPixel(i, j);
+        return pixels[indexPixel(i, j)];
+    }
+
+    void write(const std::string& filename) const {
+        int nbChannels = 3;
+        std::vector<unsigned char> data(nbChannels * width * height);
+        for (int i = 0; i < pixels.size(); ++i) {
+            const Vector3& p = pixels[i];
+            int offset = nbChannels * i;
+            data[offset + 0] = static_cast<unsigned char>(std::min(std::max(0.0, p.x * 255.0), 255.0));
+            data[offset + 1] = static_cast<unsigned char>(std::min(std::max(0.0, p.y * 255.0), 255.0));
+            data[offset + 2] = static_cast<unsigned char>(std::min(std::max(0.0, p.z * 255.0), 255.0));
+        }
+        if (!silent) std::cout << "Exporting.." << std::endl;
+        int errcode = stbi_write_png(filename.c_str(), width, height, nbChannels, data.data(), nbChannels * width);
+        if (!errcode)
+        {
+            std::cout << "Error while exporting the resulting image." << std::endl;
+            exit(errcode);
+        }
+    }
+
+    void operator=(const Vector3 & value) {
+        fill(pixels.begin(), pixels.end(), value);
+    }
+
+    void operator=(const double value) {
+        fill(pixels.begin(), pixels.end(), Vector3(value, value, value));
+    }
+
+    void operator+=(const Image& other) {
+#pragma omp parallel for
+        for (int i = 0; i < pixels.size(); ++i) {
+            pixels[i] += other.pixels[i];
+        }
+    }
+
+    void operator-=(const Image& other) {
+#pragma omp parallel for
+        for (int i = 0; i < pixels.size(); ++i) {
+            pixels[i] -= other.pixels[i];
+        }
+    }
+
+    void operator/=(double value) {
+        double scale = 1 / value;
+#pragma omp parallel for
+        for (int i = 0; i < pixels.size(); ++i) {
+            pixels[i] *= scale;
+        }
+    }
+
+    cimg_library::CImg<Vector3::real> asCimg() const {
+        std::vector<Vector3::real> cimg_pixels(3 * pixels.size());
+#pragma omp parallel for
+        for (int i = 0; i < pixels.size(); ++i) {
+            const Vector3& p = pixels[i];
+            cimg_pixels[i + pixels.size() * 0] = p.x;
+            cimg_pixels[i + pixels.size() * 1] = p.y;
+            cimg_pixels[i + pixels.size() * 2] = p.z;
+        }
+        return cimg_library::CImg<Vector3::real>(cimg_pixels.data(), width, height, 1, 3);
+    }
+
+    void fromCimg(const cimg_library::CImg<Vector3::real> & cimg) {
+        const Vector3::real * cimg_pixels = cimg.data();
+#pragma omp parallel for
+        for (int i = 0; i < pixels.size(); ++i) {
+            Vector3& p = pixels[i];
+            p.x = cimg_pixels[i + pixels.size() * 0];
+            p.y = cimg_pixels[i + pixels.size() * 1];
+            p.z = cimg_pixels[i + pixels.size() * 2];
+        }
+    }
+
+public:
+    std::vector<Vector3> pixels;
+    int width, height;
+};
+
+class Projection
+{
+public:
+    int index;
+    double value;
+};
+
+static std::vector<Projection> project_colors_onto_direction(const Image & image, const Vector3 & theta)
+{
+    std::vector<Projection> projections(image.width * image.height);
+#pragma omp parallel for
+    for (int i = 0; i < projections.size(); ++i) {
+        projections[i].index = i;
+        projections[i].value = theta.dot(image.pixels[i]);
+
+        double x = theta.dot(image.pixels[projections[i].index]);
+        assert(std::abs(projections[i].value - x) < 1e-5);
+    }
+    std::sort(projections.begin(), projections.end(), [](const Projection& a, const Projection& b) {
+        return a.value < b.value;
+    });
+    for (int i = 0; i < projections.size(); ++i) {
+        double x = theta.dot(image.pixels[projections[i].index]);
+        assert(std::abs(projections[i].value - x) < 1e-5);
+    }
+
+    return projections;
+}
+
+static double advect(Image& output, const Image& source, const Image& target, double epsilon)
+{
+    Vector3 theta = Vector3::DrawRandomDirection();
+    if (!silent) std::cout << "Projecting onto random direction " << theta << std::endl;
+    const std::vector<Projection> & source_proj = project_colors_onto_direction(source, theta);
+    const std::vector<Projection> & target_proj = project_colors_onto_direction(target, theta);
+
+    double energy = 0;
+#pragma omp parallel for
+    for (int i = 0; i < source_proj.size(); ++i) {
+        if (i > 0) {
+            assert(source_proj[i - 1].value <= source_proj[i].value);
+            assert(target_proj[i - 1].value <= target_proj[i].value);
+        }
+        double diff = target_proj[i].value - source_proj[i].value;
+        int j = source_proj[i].index;
+        output.pixels[j] += theta * diff * epsilon;
+#pragma omp atomic
+        energy += diff * diff;
+    }
+
+    return energy / source_proj.size();
+}
+
+void exportTransportPlan(const std::string & filename, const Image & source, const Image& output) {
+    if (!silent) std::cout << "Exporting transport plan to " << filename << "..." << std::endl;
+    std::ofstream file(filename, std::ios::binary);
+    unsigned int s = (unsigned int)source.pixels.size();
+    file.write((const char*)&s, sizeof(s));
+    std::cout << (unsigned int)source.pixels.size() << std::endl;
+    for (int i = 0; i < source.pixels.size(); ++i) {
+        const Vector3& sp = source.pixels[i];
+        file.write((const char*)&sp, sizeof(sp));
+        if (i == 0) std::cout << sp << std::endl;
+        const Vector3& op = output.pixels[i];
+        file.write((const char*)&op, sizeof(op));
+    }
+    file.close();
+}
 
 int main(int argc, char **argv)
 {
@@ -49,64 +354,154 @@ int main(int argc, char **argv)
   app.add_option("-s,--source", sourceImage, "Source image")->required()->check(CLI::ExistingFile);;
   std::string targetImage;
   app.add_option("-t,--target", targetImage, "Target image")->required()->check(CLI::ExistingFile);;
-  std::string outputImage= "output.png";
+  std::string outputImage = "output.png";
   app.add_option("-o,--output", outputImage, "Output image")->required();
+  std::string resizedTargetImage = "";
+  app.add_option("-z,--resized-target", resizedTargetImage, "Resized target image output");
+  std::string transportPlan = "";
+  app.add_option("-p,--transport-plan", transportPlan, "Export transport plan into an adhoc .plan format");
+  std::string transportRegularizedPlan = "";
+  app.add_option("-q,--regularized-transport-plan", transportRegularizedPlan, "Export transport plan after regularization");
   unsigned int nbSteps = 3;
   app.add_option("-n,--nbsteps", nbSteps, "Number of sliced steps (3)");
+  unsigned int batchSize = 5;
+  app.add_option("-b,--batchsize", batchSize, "Batch size (5)");
+  double epsilon = 1.0;
+  app.add_option("-e,--epsilon", epsilon, "Epsilon learning rate (1.0)");
+  float sigmaS = 1.0f;
+  app.add_option("-x,--sigma-s", sigmaS, "Standard deviation over spatial dimensions, set to 0 to disable regularization (1.0)");
+  float sigmaR = 1.0f;
+  app.add_option("-r,--sigma-r", sigmaR, "Standard deviation over color dimensions (1.0)");
   silent = false;
   app.add_flag("--silent", silent, "No verbose messages");
   CLI11_PARSE(app, argc, argv);
   
   //Image loading
-  int width,height, nbChannels;
-  unsigned char *source = stbi_load(sourceImage.c_str(), &width, &height, &nbChannels, 0);
-  if (!silent) std::cout<< "Source image: "<<width<<"x"<<height<<"   ("<<nbChannels<<")"<< std::endl;
-  int width_target,height_target, nbChannels_target;
-  unsigned char *target = stbi_load(targetImage.c_str(), &width_target, &height_target, &nbChannels_target, 0);
-  if (!silent) std::cout<< "Target image: "<<width_target<<"x"<<height_target<<"   ("<<nbChannels_target<<")"<< std::endl;
-  if ((width*height) != (width_target*height_target))
+  Image source(sourceImage, "Source image");
+  Image target(targetImage, "Target image");
+  if ((source.width* source.height) != (target.width* target.height))
   {
-    std::cout<< "Image sizes do not match. "<<std::endl;
-    exit(1);
-  }
-  if (nbChannels < 3)
-  {
-    std::cout<< "Input images must be RGB images."<<std::endl;
-    exit(1);
+      if (!silent) std::cout << "size do not match, resizing target..." << std::endl;
+      Image resized_target(source.width, source.height);
+      if (target.width * target.height < source.width * source.height) {
+          std::random_device rd;
+          std::mt19937 gen(rd());
+          std::uniform_int_distribution<int> distrib(0, target.pixels.size() - 1);
+          int i = 0;
+          for (; i < target.pixels.size(); ++i) {
+              resized_target.pixels[i] = target.pixels[i];
+          }
+          for (; i < resized_target.pixels.size(); ++i) {
+              int j = distrib(gen);
+              resized_target.pixels[i] = target.pixels[j];
+          }
+      }
+      else {
+          std::random_device rd;
+          std::mt19937 gen(rd());
+          std::uniform_int_distribution<int> distrib(0, target.pixels.size() - 1);
+          for (int i = 0; i < resized_target.pixels.size(); ++i) {
+              int j = distrib(gen);
+              resized_target.pixels[i] = target.pixels[j];
+          }
+      }
+      target = resized_target;
+      if (!resizedTargetImage.empty()) {
+          target.write(resizedTargetImage);
+      }
   }
    
-  //Main computation
-  std::vector<unsigned char> output(width*height*nbChannels);
-  
-  //As an example, we just scan the pixels of the source image
-  //and swap the color channels.
-  for(auto i = 0 ; i < width ; ++i)
-  {
-    for(auto j = 0; j < height; ++j)
-    {
-      auto indexPixel = nbChannels*(width*j+i);
-      unsigned char r = source[ indexPixel ];
-      unsigned char g = source[ indexPixel + 1];
-      unsigned char b = source[ indexPixel + 2];
-      //Swapping the channels
-      output[ indexPixel ] = b;
-      output[ indexPixel + 1 ] = g;
-      output[ indexPixel + 2 ] = r;
-      if (nbChannels == 4) //just copying the alpha value if any
-        output[ indexPixel + 3] = source[ indexPixel + 3];
-    }
+  Image output(source);
+#if PARALLEL_BATCH
+  std::vector<std::unique_ptr<Image>> batches(batchSize);
+  for (int k = 0; k < batchSize; ++k) {
+      batches[k] = std::make_unique<Image>(source.width, source.height);
+  }
+#  define BATCH *batches[k]
+#else // PARALLEL_BATCH
+  Image batch(source.width, source.height);
+#  define BATCH batch
+#endif // PARALLEL_BATCH
+
+  // Optimal Transport
+  BenchmarkTimer otTimer;
+  for (int i = 0; i < nbSteps; ++i) {
+      if (batchSize <= 1) {
+          double energy = advect(output, output, target, epsilon);
+          if (!silent) std::cout << "energy: " << energy << std::endl;
+      }
+      else
+      {
+          if (!silent) std::cout << "starting batch #" << i << "..." << std::endl;
+          double batchEnergy = 0;
+
+#if !PARALLEL_BATCH
+          BATCH = 0;
+#endif // PARALLEL_BATCH
+
+#if PARALLEL_BATCH
+#  pragma omp parallel for
+#endif // PARALLEL_BATCH
+          for (int k = 0; k < batchSize; ++k) {
+#if PARALLEL_BATCH
+              BATCH = 0;
+#endif // PARALLEL_BATCH
+              double energy = advect(BATCH, output, target, epsilon);
+              if (!silent) std::cout << "energy: " << energy << std::endl;
+#if PARALLEL_BATCH
+#  pragma omp atomic
+#endif // PARALLEL_BATCH
+              batchEnergy += energy;
+          }
+
+          batchEnergy /= batchSize;
+          if (!silent) std::cout << "batch energy: " << batchEnergy << "..." << std::endl;
+
+          for (int k = 0; k < batchSize; ++k) {
+              BATCH /= batchSize;
+              output += BATCH;
+          }
+      }
+  }
+  double duration = otTimer.ellapsed();
+  if (!silent) std::cout << "Optimal Transport computed in " << duration << " ms" << std::endl;
+
+  // Plan export
+  if (!transportPlan.empty()) {
+      exportTransportPlan(transportPlan, source, output);
   }
   
-  //Final export
-  if (!silent) std::cout<<"Exporting.."<<std::endl;
-  int errcode = stbi_write_png(outputImage.c_str(), width, height, nbChannels, output.data(), nbChannels*width);
-  if (!errcode)
-  {
-    std::cout<<"Error while exporting the resulting image."<<std::endl;
-    exit(errcode);
+  // Regularization
+  if (sigmaS > 0) {
+      BenchmarkTimer regTimer, convertTimer;
+      double convertDuration = 0;
+      Image plan(output);
+      plan -= source;
+
+      convertTimer.reset();;
+      auto plan_cimg = plan.asCimg();
+      auto source_cimg = source.asCimg();
+      convertDuration += convertTimer.ellapsed();
+
+      plan_cimg.blur_bilateral(source_cimg, sigmaS, sigmaR);
+
+      convertTimer.reset();;
+      plan.fromCimg(plan_cimg);
+      convertDuration += convertTimer.ellapsed();
+
+      output = source;
+      output += plan;
+      double duration = regTimer.ellapsed();
+      if (!silent) std::cout << "Regularization computed in " << duration << " ms (including " << convertDuration << " ms for round trip to CImg)" << std::endl;
   }
+
+  if (!transportRegularizedPlan.empty()) {
+      exportTransportPlan(transportRegularizedPlan, source, output);
+  }
+
+  // Final export
+  if (!silent) std::cout << "Optimal Transport computed in " << duration << " ms" << std::endl;
+  output.write(outputImage);
   
-  stbi_image_free(source);
-  stbi_image_free(target);
   exit(0);
 }
