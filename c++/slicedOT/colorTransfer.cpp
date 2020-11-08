@@ -340,12 +340,44 @@ void exportTransportPlan(const std::string & filename, const Image & source, con
     for (int i = 0; i < source.pixels.size(); ++i) {
         const Vector3& sp = source.pixels[i];
         file.write((const char*)&sp, sizeof(sp));
-        if (i == 0) std::cout << sp << std::endl;
         const Vector3& op = output.pixels[i];
         file.write((const char*)&op, sizeof(op));
     }
     file.close();
 }
+
+class CheckpointLogger {
+public:
+    CheckpointLogger() {}
+    ~CheckpointLogger() {
+        if (m_file.is_open()) {
+            m_file.close();
+        }
+    }
+    CheckpointLogger(const CheckpointLogger&) = delete;
+    void operator=(const CheckpointLogger&) = delete;
+
+    void start(const std::string & filename, unsigned int width, unsigned int height) {
+        m_width = width;
+        m_height = height;
+        m_file.open(filename, std::ios::binary);
+        m_file.write((const char*)&width, sizeof(width));
+        m_file.write((const char*)&height, sizeof(height));
+    }
+
+    void checkpoint(const Image & image) {
+        if (!m_file.is_open()) return;
+        assert(image.pixels.size() == m_width * m_height);
+        for (int i = 0; i < image.pixels.size(); ++i) {
+            const Vector3& sp = image.pixels[i];
+            m_file.write((const char*)&sp, sizeof(sp));
+        }
+    }
+
+private:
+    std::ofstream m_file;
+    unsigned int m_width, m_height;
+};
 
 int main(int argc, char **argv)
 {
@@ -362,6 +394,8 @@ int main(int argc, char **argv)
   app.add_option("-p,--transport-plan", transportPlan, "Export transport plan into an adhoc .plan format");
   std::string transportRegularizedPlan = "";
   app.add_option("-q,--regularized-transport-plan", transportRegularizedPlan, "Export transport plan after regularization");
+  std::string checkpointLogFilename = "";
+  app.add_option("-c,--checkpoint-log", checkpointLogFilename, "Ad-hoc checkpointing format");
   unsigned int nbSteps = 3;
   app.add_option("-n,--nbsteps", nbSteps, "Number of sliced steps (3)");
   unsigned int batchSize = 5;
@@ -410,6 +444,14 @@ int main(int argc, char **argv)
           target.write(resizedTargetImage);
       }
   }
+
+  // Checkpointing
+  CheckpointLogger logger;
+  if (!checkpointLogFilename.empty()) {
+      logger.start(checkpointLogFilename, source.width, source.height);
+  }
+
+  logger.checkpoint(source);
    
   Image output(source);
 #if PARALLEL_BATCH
@@ -462,6 +504,8 @@ int main(int argc, char **argv)
               output += BATCH;
           }
       }
+
+      logger.checkpoint(output);
   }
   double duration = otTimer.ellapsed();
   if (!silent) std::cout << "Optimal Transport computed in " << duration << " ms" << std::endl;
@@ -498,6 +542,8 @@ int main(int argc, char **argv)
   if (!transportRegularizedPlan.empty()) {
       exportTransportPlan(transportRegularizedPlan, source, output);
   }
+
+  logger.checkpoint(output);
 
   // Final export
   if (!silent) std::cout << "Optimal Transport computed in " << duration << " ms" << std::endl;
