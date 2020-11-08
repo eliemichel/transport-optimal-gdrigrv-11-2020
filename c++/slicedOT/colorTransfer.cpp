@@ -23,6 +23,13 @@
  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+
+/**
+ * This is a version of the base file by Elie Michel
+ * Original file can be found at:
+ * https://github.com/dcoeurjo/transport-optimal-gdrigrv-11-2020/blob/main/c%2B%2B/slicedOT/colorTransfer.cpp
+ */
+
 #include <iostream>
 #include <string>
 #include <random>
@@ -41,11 +48,19 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
+// Turn this to 0 to avoid using parallelization for batching
+// NB batches are useless if not parallelized (actually somehow
+// worst than sequential in that case) so turning this off must
+// only be for debugging purposes
 #define PARALLEL_BATCH 1
 
 //Global flag to silent verbose messages
 bool silent;
 
+/**
+ * A utility class to measure performance timings
+ * Usage: t = BenchmarkTimer(); ...; cout << "it took " << t.ellapsed() << " ms";
+ */
 class BenchmarkTimer
 {
 public:
@@ -53,6 +68,10 @@ public:
         reset();
     }
 
+    /**
+     * By default the timer starts at creation but it may be reset at some point
+     * using this method.
+     */
     void reset() {
         m_startTime = std::chrono::high_resolution_clock::now();
     }
@@ -63,7 +82,9 @@ public:
         return std::chrono::duration_cast<std::chrono::duration<double, std::ratio<1, 1000>>>(dt).count();
     }
 
-    /// Return the precise ellapsed system time since creation of this object in milliseconds
+    /**
+     * Return the precise ellapsed system time since creation of this object in milliseconds
+     */
     double ellapsed() const
     {
         return milliseconds(std::chrono::high_resolution_clock::now() - m_startTime);
@@ -73,10 +94,18 @@ private:
     std::chrono::high_resolution_clock::time_point m_startTime;
 };
 
+/**
+ * A basic Vector3 type used here represent colors
+ */
 class Vector3 {
 public:
     using real = double;
 public:
+    /**
+     * Return a random direction evenly distributed on the unit sphere
+     * restricted to the directions that are orthogonal to the previously
+     * drawn one (not garranteed in parallel execution).
+     */
     static Vector3 DrawRandomDirection()
     {
         static std::random_device rd;
@@ -150,6 +179,13 @@ public:
     real x, y, z;
 };
 
+/**
+ * Simple object oriented wrapper around stb_image library for loading/saving
+ * and perform simple pixelwise operations in parallel.
+ * NB: This class does not prevent implicit copying of image content so avoid
+ * doing imageA = imageB too much, prefer in-place operations such as += over
+ * other ones (e.g. +).
+ */
 class Image
 {
 public:
@@ -186,19 +222,8 @@ public:
     //Image(const Image& other) = delete;
     //Image & operator=(const Image&) = delete;
 
-    Image && copy() const {
-        Image img(width, height);
-        img.pixels = pixels;
-        return std::move(img);
-    }
-
-    int indexPixel(int i, int j) const {
-        return width * j + i;
-    }
-
     const Vector3 & colorAt(int i, int j) const {
-        int offset = indexPixel(i, j);
-        return pixels[indexPixel(i, j)];
+      return pixels[width * j + i];
     }
 
     void write(const std::string& filename) const {
@@ -250,6 +275,11 @@ public:
         }
     }
 
+    /**
+     * Convert the image to CImg library representation, to use CImg's bilateral filter
+     * (unfortunately not using the same underlying data layout, but copying is 2 orders
+     * of magnitude faster than the filtering itself).
+     */
     cimg_library::CImg<Vector3::real> asCimg() const {
         std::vector<Vector3::real> cimg_pixels(3 * pixels.size());
 #pragma omp parallel for
@@ -262,6 +292,9 @@ public:
         return cimg_library::CImg<Vector3::real>(cimg_pixels.data(), width, height, 1, 3);
     }
 
+    /**
+     * Convert back from CImg
+     */
     void fromCimg(const cimg_library::CImg<Vector3::real> & cimg) {
         const Vector3::real * cimg_pixels = cimg.data();
 #pragma omp parallel for
@@ -278,6 +311,10 @@ public:
     int width, height;
 };
 
+/**
+ * A projected pixel is represented by its index in the original pixel vector
+ * and its projection (dot product) onto the target axis.
+ */
 class Projection
 {
 public:
@@ -285,7 +322,11 @@ public:
     double value;
 };
 
-static std::vector<Projection> project_colors_onto_direction(const Image & image, const Vector3 & theta)
+/**
+ * Return a vector of projected pixel information (Projection obects) from image
+ * sorted by their projection onto the direction theta.
+ */
+static std::vector<Projection> sortPixelsAlong(const Image & image, const Vector3 & theta)
 {
     std::vector<Projection> projections(image.width * image.height);
 #pragma omp parallel for
@@ -299,20 +340,28 @@ static std::vector<Projection> project_colors_onto_direction(const Image & image
     std::sort(projections.begin(), projections.end(), [](const Projection& a, const Projection& b) {
         return a.value < b.value;
     });
+
+#ifndef NDEBUG
+    // Sanity check
     for (int i = 0; i < projections.size(); ++i) {
         double x = theta.dot(image.pixels[projections[i].index]);
         assert(std::abs(projections[i].value - x) < 1e-5);
     }
+#endif // NDEBUG
 
     return projections;
 }
 
-static double advect(Image& output, const Image& source, const Image& target, double epsilon)
+/**
+ * Advects colors from source to target along a random direction and store
+ * the result into the output image. The advection step is multiplied by epsilon.
+ */
+static double advect(Image& output, const Image& source, const Image& target, double epsilon = 1.0)
 {
     Vector3 theta = Vector3::DrawRandomDirection();
     if (!silent) std::cout << "Projecting onto random direction " << theta << std::endl;
-    const std::vector<Projection> & source_proj = project_colors_onto_direction(source, theta);
-    const std::vector<Projection> & target_proj = project_colors_onto_direction(target, theta);
+    const std::vector<Projection> & source_proj = sortPixelsAlong(source, theta);
+    const std::vector<Projection> & target_proj = sortPixelsAlong(target, theta);
 
     double energy = 0;
 #pragma omp parallel for
@@ -331,6 +380,9 @@ static double advect(Image& output, const Image& source, const Image& target, do
     return energy / source_proj.size();
 }
 
+/**
+ * Export transport plan to an ad-hoc file format for visualisation
+ */
 void exportTransportPlan(const std::string & filename, const Image & source, const Image& output) {
     if (!silent) std::cout << "Exporting transport plan to " << filename << "..." << std::endl;
     std::ofstream file(filename, std::ios::binary);
@@ -346,6 +398,9 @@ void exportTransportPlan(const std::string & filename, const Image & source, con
     file.close();
 }
 
+/**
+ * Export all steps of the advections to an ad-hoc file format for visualisation
+ */
 class CheckpointLogger {
 public:
     CheckpointLogger() {}
@@ -390,12 +445,14 @@ int main(int argc, char **argv)
   app.add_option("-o,--output", outputImage, "Output image")->required();
   std::string resizedTargetImage = "";
   app.add_option("-z,--resized-target", resizedTargetImage, "Resized target image output");
+
   std::string transportPlan = "";
   app.add_option("-p,--transport-plan", transportPlan, "Export transport plan into an adhoc .plan format");
   std::string transportRegularizedPlan = "";
   app.add_option("-q,--regularized-transport-plan", transportRegularizedPlan, "Export transport plan after regularization");
   std::string checkpointLogFilename = "";
-  app.add_option("-c,--checkpoint-log", checkpointLogFilename, "Ad-hoc checkpointing format");
+  app.add_option("-c,--checkpoint-log", checkpointLogFilename, "Another ad-hoc checkpointing format .ot");
+  
   unsigned int nbSteps = 3;
   app.add_option("-n,--nbsteps", nbSteps, "Number of sliced steps (3)");
   unsigned int batchSize = 5;
@@ -410,9 +467,11 @@ int main(int argc, char **argv)
   app.add_flag("--silent", silent, "No verbose messages");
   CLI11_PARSE(app, argc, argv);
   
-  //Image loading
   Image source(sourceImage, "Source image");
   Image target(targetImage, "Target image");
+  Image output(source);
+
+  // Resize target image if it has a different number of pixels than the source.
   if ((source.width* source.height) != (target.width* target.height))
   {
       if (!silent) std::cout << "size do not match, resizing target..." << std::endl;
@@ -420,7 +479,7 @@ int main(int argc, char **argv)
       if (target.width * target.height < source.width * source.height) {
           std::random_device rd;
           std::mt19937 gen(rd());
-          std::uniform_int_distribution<int> distrib(0, target.pixels.size() - 1);
+          std::uniform_int_distribution<int> distrib(0, static_cast<int>(target.pixels.size()) - 1);
           int i = 0;
           for (; i < target.pixels.size(); ++i) {
               resized_target.pixels[i] = target.pixels[i];
@@ -433,7 +492,7 @@ int main(int argc, char **argv)
       else {
           std::random_device rd;
           std::mt19937 gen(rd());
-          std::uniform_int_distribution<int> distrib(0, target.pixels.size() - 1);
+          std::uniform_int_distribution<int> distrib(0, static_cast<int>(target.pixels.size()) - 1);
           for (int i = 0; i < resized_target.pixels.size(); ++i) {
               int j = distrib(gen);
               resized_target.pixels[i] = target.pixels[j];
@@ -452,11 +511,13 @@ int main(int argc, char **argv)
   }
 
   logger.checkpoint(source);
-   
-  Image output(source);
+  
+  // Allocate memory for all images of a batch because they will be filled in parallel
+  // this makes batching more memory intensive (but gives the benefit of running in
+  // parallel).
 #if PARALLEL_BATCH
   std::vector<std::unique_ptr<Image>> batches(batchSize);
-  for (int k = 0; k < batchSize; ++k) {
+  for (unsigned int k = 0; k < batchSize; ++k) {
       batches[k] = std::make_unique<Image>(source.width, source.height);
   }
 #  define BATCH *batches[k]
@@ -465,9 +526,9 @@ int main(int argc, char **argv)
 #  define BATCH batch
 #endif // PARALLEL_BATCH
 
-  // Optimal Transport
+  // Core of Sliced Optimal Transport
   BenchmarkTimer otTimer;
-  for (int i = 0; i < nbSteps; ++i) {
+  for (unsigned int i = 0; i < nbSteps; ++i) {
       if (batchSize <= 1) {
           double energy = advect(output, output, target, epsilon);
           if (!silent) std::cout << "energy: " << energy << std::endl;
@@ -484,7 +545,7 @@ int main(int argc, char **argv)
 #if PARALLEL_BATCH
 #  pragma omp parallel for
 #endif // PARALLEL_BATCH
-          for (int k = 0; k < batchSize; ++k) {
+          for (int k = 0; k < (int)batchSize; ++k) {
 #if PARALLEL_BATCH
               BATCH = 0;
 #endif // PARALLEL_BATCH
@@ -499,7 +560,7 @@ int main(int argc, char **argv)
           batchEnergy /= batchSize;
           if (!silent) std::cout << "batch energy: " << batchEnergy << "..." << std::endl;
 
-          for (int k = 0; k < batchSize; ++k) {
+          for (unsigned int k = 0; k < batchSize; ++k) {
               BATCH /= batchSize;
               output += BATCH;
           }
@@ -515,21 +576,23 @@ int main(int argc, char **argv)
       exportTransportPlan(transportPlan, source, output);
   }
   
-  // Regularization
+  // Regularization using bilateral filtering on transport plan
   if (sigmaS > 0) {
       BenchmarkTimer regTimer, convertTimer;
       double convertDuration = 0;
       Image plan(output);
       plan -= source;
 
-      convertTimer.reset();;
+      // We convert to CImg to use their bilateral blur
+      convertTimer.reset();
       auto plan_cimg = plan.asCimg();
       auto source_cimg = source.asCimg();
       convertDuration += convertTimer.ellapsed();
 
       plan_cimg.blur_bilateral(source_cimg, sigmaS, sigmaR);
 
-      convertTimer.reset();;
+      // Convert back
+      convertTimer.reset();
       plan.fromCimg(plan_cimg);
       convertDuration += convertTimer.ellapsed();
 
